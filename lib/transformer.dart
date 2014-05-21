@@ -14,11 +14,12 @@
 
 library zengen.transformer;
 
-import 'dart:async' show Future;
+import 'dart:async';
 
 import 'package:analyzer/analyzer.dart';
 import 'package:analyzer/src/generated/ast.dart';
 import 'package:barback/barback.dart';
+import 'package:path/path.dart' as p;
 
 import 'package:zengen/zengen.dart';
 
@@ -39,14 +40,43 @@ class ZengenTransformer extends Transformer {
   Future apply(Transform transform) {
     return transform.primaryInput.readAsString().then((content) {
       final id = transform.primaryInput.id;
-      final newContent = traverseModifiers(content);
-      if (newContent != content) {
-        transform.logger.fine("new content for $id : \n$newContent", asset: id);
-        transform.addOutput(new Asset.fromString(id, newContent));
+      final cu = parseCompilationUnit(content);
+
+      // parts will be merged into the library. So we skip it.
+      if (cu.directives.any((e) => e is PartOfDirective)) {
+        transform.consumePrimary();
+        return null;
       }
+
+      // merge parts if any
+      final transformations = cu.directives.where((e) => e is PartDirective
+          ).map((PartDirective part) {
+        final partId = new AssetId(id.package, p.joinAll([]
+            ..addAll(p.split(id.path)..removeLast())
+            ..addAll(p.split(part.uri.stringValue))));
+        return transform.readInputAsString(partId).then((source) =>
+            new Transformation(part.offset, part.end, removePartOf(source)));
+      });
+      return Future.wait(transformations).then((List<Transformation> transformations) {
+        content = applyTransformations(content, transformations);
+        transform.addOutput(new Asset.fromString(id, content));
+
+
+        final newContent = traverseModifiers(content);
+        if (newContent != content) {
+          transform.logger.fine("new content for $id : \n$newContent", asset: id
+              );
+          transform.addOutput(new Asset.fromString(id, newContent));
+        }
+      });
     });
   }
 }
+
+String removePartOf(String content) => applyTransformations(content,
+    parseCompilationUnit(content).directives.where((e) => e is PartOfDirective).map(
+    (d) => new Transformation.deletation(d.offset, d.end)));
+
 
 String traverseModifiers(String content) {
   bool modifications = true;
@@ -82,6 +112,7 @@ class Transformation {
   Transformation.insertion(int index, this.content)
       : begin = index,
         end = index;
+  Transformation.deletation(this.begin, this.end) : content = '';
 }
 
 class ToStringAppender implements ContentModifier {
